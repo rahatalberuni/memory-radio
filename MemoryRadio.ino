@@ -180,6 +180,7 @@ void uploadAudio(bool answer){
   size_t samples=answer?recordCount.load():originalCount;
   if(samples<16000){problem("PLEASE RECORD AT LEAST ONE SECOND OF SPEECH.");return;}
   beginWait(answer?"GEMINI IS WEAVING YOUR NEW DETAIL INTO THE STORY...":"GEMINI IS LISTENING AND BUILDING YOUR MEMORY...",answer?QUESTION:REVIEW);
+  requestKind=answer?"ANSWER":"STORY";
   if(wifiReady()){if(!wifiStartJob(answer?"ANSWER":"STORY",questionIndex,0,answer?capture:original,samples))problem("NETWORK IS BUSY. PLEASE TRY AGAIN.");return;}
   const int16_t *buffer=answer?capture:original;size_t bytes=samples*2;
   String source=answer?"answer"+String(answerNumber):"story";
@@ -298,7 +299,7 @@ void serialCommand(String line){
       pending.items[a][b]={decode(fields[3],100),decode(fields[4],500),decode(fields[5],300),decode(fields[6],30),fields[7].toFloat(),fields[8].toFloat()};pending.counts[a]=max(pending.counts[a],b+1);
     }
   }else if(sscanf(line.c_str(),"DONE %u",&id)==1){
-    if(waiting&&id==requestId){if(!pending.title.length()||!pending.summary.length()){problem("GEMINI RETURNED AN INCOMPLETE MEMORY. PLEASE TRY AGAIN.");return;}bool changed=memory.summary!=pending.summary;memory=pending;hasMemory=true;waiting=false;screen=SUMMARY;page=0;if(!restoringSD){if(changed){loadedAudioKind="";loadedAudioSamples=0;if(sdOK&&SD_MMC.exists(memoryFolder+"/recap.wav"))SD_MMC.rename(memoryFolder+"/recap.wav",memoryFolder+"/recap-previous-"+String(millis())+".wav");}lastBackend=millis();sdSaved=saveMetadata();}}
+    if(waiting&&id==requestId){if(!pending.title.length()||!pending.summary.length()){problem("GEMINI RETURNED AN INCOMPLETE MEMORY. PLEASE TRY AGAIN.");return;}bool narrate=!restoringSD&&(requestKind=="STORY"||requestKind=="ANSWER");bool changed=memory.summary!=pending.summary;memory=pending;hasMemory=true;waiting=false;screen=SUMMARY;page=0;if(!restoringSD){if(changed){loadedAudioKind="";loadedAudioSamples=0;if(sdOK&&SD_MMC.exists(memoryFolder+"/recap.wav"))SD_MMC.rename(memoryFolder+"/recap.wav",memoryFolder+"/recap-previous-"+String(millis())+".wav");}lastBackend=millis();sdSaved=saveMetadata();if(narrate)playAiAudio();}}
   }else if(line.startsWith("ERROR ")){
     int split=line.indexOf(' ',6);id=line.substring(6,split).toInt();if(waiting&&id==requestId)problem(decode(line.substring(split+1)));
   }else if(sscanf(line.c_str(),"AUDIO_OUT %u %u",&id,(unsigned*)&bytes)==2){

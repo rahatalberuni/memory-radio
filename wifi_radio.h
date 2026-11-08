@@ -6,6 +6,7 @@
 #include <esp_crt_bundle.h>
 #include <cJSON.h>
 #include <vector>
+#include <memory>
 #include <time.h>
 
 // The USB bridge remains optional. Credentials live in NVS, never on the SD card.
@@ -22,6 +23,8 @@ struct RadioJob {
 };
 struct RadioResult {bool ok=false,audio=false;String error,model,voice;Memory value;size_t samples=0;};
 RadioJob radioJob;RadioResult radioResult;
+std::vector<String> radioCachedModels,radioCachedVoices;
+uint32_t radioModelsChecked=0;
 
 bool wifiReady(){return WiFi.status()==WL_CONNECTED&&radioKey.length()>10;}
 bool wifiBusy(){return radioWorking.load();}
@@ -49,6 +52,7 @@ void radioSaveSettings(){
   if(!key.length())key=radioKey;
   if(key.length()<15){radioSetup.send(400,"text/plain","Enter your Gemini API key.");return;}
   radioSSID=ssid;radioPassword=password;radioKey=key;radioModel="auto";radioVoice="auto";
+  radioModelsChecked=0;radioCachedModels.clear();radioCachedVoices.clear();
   radioPrefs.putString("ssid",radioSSID);radioPrefs.putString("password",radioPassword);radioPrefs.putString("key",radioKey);radioPrefs.putString("model","auto");radioPrefs.putString("voice","auto");
   radioSetupMessage="Settings saved. Check the device for Wi-Fi status.";radioReconnect=true;
   radioSetup.sendHeader("Cache-Control","no-store");radioSetup.send(200,"text/html","<meta name='viewport' content='width=device-width,initial-scale=1'><h2>Saved</h2><p>The ESP32 is connecting to your Wi-Fi. Check its screen, then tap Done.</p><a href='/'>Back to settings</a>");
@@ -107,13 +111,17 @@ String radioApiError(RadioHttp &http,const String &key){
 bool radioClock(){radioPhase=1;for(int i=0;i<120&&!radioCancel;i++){if(time(nullptr)>1735689600)return true;vTaskDelay(pdMS_TO_TICKS(100));}return false;}
 const char *radioPreferred[]={"gemini-3.5-flash-lite","gemini-2.5-flash-lite","gemini-2.5-flash","gemini-3-flash-preview","gemini-3.5-flash","gemini-3.8-flash"};
 bool radioChooseModels(RadioJob &job,std::vector<String> &textModels,std::vector<String> &voiceModels,String &error){
+  // Reuse this session's advertised models for 30 minutes, including the speech
+  // request immediately following analysis. Never cache credentials or audio.
+  if(radioModelsChecked&&millis()-radioModelsChecked<1800000){textModels=radioCachedModels;voiceModels=radioCachedVoices;return true;}
   radioPhase=2;RadioHttp http;if(!http.open("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",job.key,0,false)||!http.headers()){error=http.error;return false;}
   if(http.status!=200){error=radioApiError(http,job.key);return false;}char *data=http.text(384*1024);if(!data){error=http.error;return false;}cJSON *root=cJSON_Parse(data);free(data);if(!root){error="GEMINI MODEL LIST COULD NOT BE READ.";return false;}
   std::vector<String> available;cJSON *entry=nullptr; cJSON_ArrayForEach(entry,cJSON_GetObjectItem(root,"models")){String name=jString(entry,"name");if(name.startsWith("models/"))name=name.substring(7);bool supports=false;cJSON *method=nullptr;cJSON_ArrayForEach(method,cJSON_GetObjectItem(entry,"supportedGenerationMethods")){if(cJSON_IsString(method)&&String(method->valuestring)=="generateContent")supports=true;}if(supports)available.push_back(name);}
   auto has=[&](const String &name){for(auto &n:available)if(n==name)return true;return false;};
   if(job.model!="auto"&&has(job.model))textModels.push_back(job.model);for(auto name:radioPreferred)if(has(name)&&String(name)!=job.model)textModels.push_back(name);
   if(job.voice!="auto"&&has(job.voice))voiceModels.push_back(job.voice);for(auto name:{"gemini-3.1-flash-tts-preview","gemini-2.5-flash-preview-tts"})if(has(name)&&String(name)!=job.voice)voiceModels.push_back(name);
-  cJSON_Delete(root);if(textModels.empty()){error="NO COMPATIBLE GEMINI FLASH MODEL IS AVAILABLE FOR THIS KEY.";return false;}return true;
+  cJSON_Delete(root);if(textModels.empty()){error="NO COMPATIBLE GEMINI FLASH MODEL IS AVAILABLE FOR THIS KEY.";return false;}
+  radioCachedModels=textModels;radioCachedVoices=voiceModels;radioModelsChecked=millis();return true;
 }
 void radioWavHeader(uint8_t *h,size_t count){memset(h,0,44);memcpy(h,"RIFF",4);uint32_t v=count*2+36;memcpy(h+4,&v,4);memcpy(h+8,"WAVEfmt ",8);v=16;memcpy(h+16,&v,4);h[20]=1;h[22]=1;v=16000;memcpy(h+24,&v,4);v=32000;memcpy(h+28,&v,4);h[32]=2;h[34]=16;memcpy(h+36,"data",4);v=count*2;memcpy(h+40,&v,4);}
 bool radioWriteAudio(RadioHttp &http,const int16_t *pcm,size_t count){
@@ -180,31 +188,43 @@ struct RadioBodyReader {
   int get(){if(at>=count){count=http.read(buffer,sizeof(buffer));at=0;if(count<=0)return -1;}return (uint8_t)buffer[at++];}
 };
 struct RadioMemoryReader {const char *data;size_t at=0;int get(){return data[at]?(uint8_t)data[at++]:-1;}};
-template<class Reader>bool radioExtractAudio(Reader &reader,File &out,String &envelope,size_t &audioBytes){
+template<class Reader,size_t DecodeSize=1024>bool radioExtractAudio(Reader &reader,File &out,String &envelope,size_t &audioBytes){
   envelope="";audioBytes=0;String lastString,key;char previous=0;int c;
+  // SD writes have substantial per-call overhead. Flush whole blocks instead
+  // of writing every three decoded bytes within the HTTPS response deadline.
+  std::unique_ptr<uint8_t,decltype(&free)> storage((uint8_t*)radioAlloc(3072+DecodeSize+DecodeSize/4*3),free);
+  if(!storage)return false;
+  uint8_t *block=storage.get(),*group=block+3072,*decoded=group+DecodeSize;size_t buffered=0;
   while((c=reader.get())>=0&&!radioCancel){
     if(c=='"'){
       bool audioValue=previous==':'&&key=="data";
-      envelope+='"';String token;unsigned char group[4],decoded[3];int used=0;bool ended=false,escaped=false;
+      envelope+='"';String token;size_t used=0;bool ended=false,escaped=false;
+      auto decodeBlock=[&](){
+        if(!used)return true;
+        size_t n=0;if(mbedtls_base64_decode(decoded,DecodeSize/4*3,&n,group,used)!=0||audioBytes+n>3200000)return false;
+        if(buffered+n>3072){if(out.write(block,buffered)!=buffered)return false;buffered=0;}
+        memcpy(block+buffered,decoded,n);buffered+=n;audioBytes+=n;used=0;return true;
+      };
       while((c=reader.get())>=0){
         if(!escaped&&c=='"'){ended=true;break;}
         if(audioValue){
           if(c=='\\'){c=reader.get();if(c!='/')return false;}
           if(c==' '||c=='\n'||c=='\r'||c=='\t')continue;
           group[used++]=(unsigned char)c;
-          if(used==4){size_t n=0;if(mbedtls_base64_decode(decoded,sizeof(decoded),&n,group,4)!=0||audioBytes+n>3200000)return false;if(out.write(decoded,n)!=n)return false;audioBytes+=n;used=0;}
+          if(used==DecodeSize&&!decodeBlock())return false;
         }else{
           envelope+=(char)c;if(envelope.length()>96000)return false;
           if(token.length()<200)token+=(char)c;
           if(c=='\\'&&!escaped)escaped=true;else escaped=false;
         }
       }
-      if(!ended||(audioValue&&used))return false;envelope+='"';lastString=token;previous='"';
+      if(!ended||(audioValue&&(used%4||!decodeBlock())))return false;envelope+='"';lastString=token;previous='"';
     }else{
       envelope+=(char)c;if(envelope.length()>96000)return false;
       if(c==':')key=lastString;if(c!=' '&&c!='\n'&&c!='\r'&&c!='\t')previous=(char)c;
     }
   }
+  if(buffered&&out.write(block,buffered)!=buffered)return false;
   return !radioCancel&&audioBytes>0;
 }
 struct RadioFileReader {
@@ -239,15 +259,18 @@ size_t radioDecodeSpeechFile(const String &path,const String &mime,String &error
 }
 String radioSpeechMime(cJSON *root){cJSON *candidate=cJSON_GetArrayItem(cJSON_GetObjectItem(root,"candidates"),0),*parts=cJSON_GetObjectItem(cJSON_GetObjectItem(candidate,"content"),"parts"),*part=nullptr;cJSON_ArrayForEach(part,parts){String mime=jString(cJSON_GetObjectItem(part,"inlineData"),"mimeType");if(mime.length())return mime;}return "";}
 bool radioNarrate(RadioJob &job,const String &model,const String &text,size_t &samples,String &error,int &httpStatus){
+  uint32_t started=millis(),headersAt=0,downloadAt=0;
   String body="{\"contents\":[{\"parts\":[{\"text\":"+jsonString("Read gently and clearly. Speak only this text: "+text)+"}]}],\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"Kore\"}}}}}";
   radioPhase=5;RadioHttp http;
   if(!http.open("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent",job.key,body.length())||!http.write(body.c_str(),body.length())||!http.headers()){error=http.error.length()?http.error:"SPEECH REQUEST TIMED OUT.";httpStatus=0;return false;}
   httpStatus=http.status;if(http.status!=200){error=radioApiError(http,job.key);return false;}
+  headersAt=millis();
   String path=job.folder+"/speech-download.tmp";File f=SD_MMC.open(path,FILE_WRITE);if(!f){error="CANNOT SAVE SPEECH TO THE MICROSD.";return false;}
-  RadioBodyReader reader{http};String envelope;size_t bytes=0;radioPhase=6;bool ok=radioExtractAudio(reader,f,envelope,bytes);f.flush();f.close();
+  RadioBodyReader reader{http};String envelope;size_t bytes=0;radioPhase=6;bool ok=radioExtractAudio(reader,f,envelope,bytes);f.flush();f.close();downloadAt=millis();
   if(!ok){error="SPEECH DOWNLOAD WAS INCOMPLETE OR TOO LARGE.";SD_MMC.remove(path);return false;}
   cJSON *root=cJSON_Parse(envelope.c_str());String mime=root?radioSpeechMime(root):String();if(root)cJSON_Delete(root);
-  samples=radioDecodeSpeechFile(path,mime,error);SD_MMC.remove(path);return samples>0;
+  samples=radioDecodeSpeechFile(path,mime,error);SD_MMC.remove(path);
+  Serial.printf("SPEECH_TIMING request_ms=%u download_ms=%u convert_ms=%u samples=%u\n",headersAt-started,downloadAt-headersAt,millis()-downloadAt,(unsigned)samples);return samples>0;
 }
 bool radioReadMemoryFile(const RadioJob &job,Memory &value,String &error){
   File f=SD_MMC.open(job.folder+"/gemini.json",FILE_READ);if(!f)f=SD_MMC.open(job.folder+"/memory.json",FILE_READ);
@@ -263,7 +286,7 @@ size_t radioExcerpt(const RadioJob &job,String &error){
 }
 bool radioRetryable(int code){return code==0||code==500||code==503||code==504;}
 void radioWorker(void*){
-  RadioJob job=radioJob;RadioResult result;String error;
+  RadioJob job=radioJob;RadioResult result;String error;uint32_t jobStarted=millis();
   if(!sdOK){result.error="INSERT A MICROSD CARD TO USE STANDALONE GEMINI.";goto finished;}
   if(job.kind=="EXCERPT"){result.samples=radioExcerpt(job,error);result.ok=result.samples>0;result.audio=true;result.error=error;goto finished;}
   if(job.kind=="LOAD"){result.ok=radioReadMemoryFile(job,result.value,error);result.error=error;goto finished;}
@@ -280,12 +303,14 @@ void radioWorker(void*){
       if(speech){String text=job.kind=="QUESTION"?job.question:job.summary;result.ok=radioNarrate(job,model,text,result.samples,error,code);result.audio=true;}
       else result.ok=radioAnalyze(job,model,result.value,error,code);
       if(result.ok){if(speech)result.voice=model;else result.model=model;break;}
+      if(code==404)radioModelsChecked=0;
       if(!radioRetryable(code)||millis()-started>100000)break;
       vTaskDelay(pdMS_TO_TICKS(1500));
     }
     result.error=safeRadioError(error,job.key);
   }
 finished:
+  Serial.printf("JOB_TIMING kind=%s elapsed_ms=%u ok=%d\n",job.kind.c_str(),millis()-jobStarted,result.ok);
   if(radioCancel){result.ok=false;result.error="REQUEST CANCELLED. YOUR RECORDING IS SAVED.";}
   radioResult=result;radioDone=true;vTaskDelete(nullptr);
 }
@@ -317,6 +342,30 @@ bool wifiSelfTest(){
   String envelope;size_t bytes=0;bool ok=radioExtractAudio(reader,out,envelope,bytes);out.close();
   File f=SD_MMC.open(path,FILE_READ);uint8_t data[8];ok=ok&&f&&bytes==8&&f.read(data,8)==8&&data[0]==0&&data[2]==1&&data[4]==2&&data[6]==3;if(f)f.close();
   cJSON *root=cJSON_Parse(envelope.c_str());ok=ok&&root&&radioSpeechMime(root)=="audio/L16;rate=24000";if(root)cJSON_Delete(root);
-  SD_MMC.remove(path);radioCancel=oldCancel;
+  SD_MMC.remove(path);
+  // Exercise full decode/SD blocks and a padded tail; compare the former
+  // four-character decoder with batching on identical input and storage.
+  char *fixture=(char*)radioAlloc(66000);
+  if(!fixture){radioCancel=oldCancel;return false;}
+  const char *prefix="{\"inlineData\":{\"mimeType\":\"audio/L16;rate=24000\",\"data\":\"";
+  strcpy(fixture,prefix);char *at=fixture+strlen(prefix);
+  for(int i=0;i<8193;i++){memcpy(at,"AAABAAIA",8);at+=8;}
+  strcpy(at,"AwA=\"}}");uint32_t slowMs=0,fastMs=0;
+  for(int pass=0;pass<2;pass++){
+    out=SD_MMC.open(path,FILE_WRITE);if(!out){ok=false;break;}
+    RadioMemoryReader large{fixture};uint32_t began=millis();
+    bool parsed=pass?radioExtractAudio(large,out,envelope,bytes):radioExtractAudio<RadioMemoryReader,4>(large,out,envelope,bytes);
+    out.flush();out.close();uint32_t elapsed=millis()-began;if(pass)fastMs=elapsed;else slowMs=elapsed;
+    f=SD_MMC.open(path,FILE_READ);ok=ok&&parsed&&bytes==49160&&f&&f.size()==49160;
+    uint8_t chunk[512];size_t offset=0;
+    while(f&&f.available()){
+      size_t n=f.read(chunk,sizeof(chunk));if(!n){ok=false;break;}
+      for(size_t i=0;i<n;i++){size_t p=offset+i;uint8_t expected=p<49158?(p%2?0:(p%6)/2):(p==49158?3:0);if(chunk[i]!=expected)ok=false;}
+      offset+=n;
+    }
+    if(f)f.close();ok=ok&&offset==49160;SD_MMC.remove(path);
+  }
+  free(fixture);Serial.printf("DECODE_BENCH bytes=49160 old_ms=%u batch_ms=%u pass=%d\n",slowMs,fastMs,ok);
+  radioCancel=oldCancel;
   return ok&&radioValidSource("story")&&radioValidSource("answer12")&&!radioValidSource("../key")&&!radioValidSource("answer../key");
 }
