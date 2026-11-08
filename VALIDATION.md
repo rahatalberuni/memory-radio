@@ -2,7 +2,7 @@
 
 Tested on the connected LCDWIKI ES3C28P ESP32-S3 N16R8 with microSD, ILI9341V display, FT6336G touch, and ES8311 audio.
 
-- Firmware compiled with the installed Arduino ESP32 3.3.12 toolchain and bundled libraries. The 1,322,256-byte application fits the existing partition; esptool verified its flash hash.
+- Firmware compiled with the installed Arduino ESP32 3.3.12 toolchain and bundled libraries. The 1,323,200-byte application fits the existing partition; esptool verified its flash hash.
 - Existing recording, memory metadata, and generated recap survived the update.
 - Password-protected setup access point started. The local setup page saved network settings and the Gemini API key to device NVS; credentials were not printed in diagnostics or published.
 - On-device streaming speech-parser and source-path checks passed.
@@ -10,6 +10,7 @@ Tested on the connected LCDWIKI ES3C28P ESP32-S3 N16R8 with microSD, ILI9341V di
 - Direct on-device speech generation and download succeeded. The ESP32 decoded/resampled the response and saved a 459,520-byte, 14.36-second PCM recap as a standard WAV on microSD.
 - The audio driver acknowledged playback. Nonzero audio frames reached I2S, the speaker amplifier was enabled, and no speaker write errors were observed. The user had also confirmed audible tones and narration during speaker validation.
 - After an actual board restart, network settings, key, selected model, memory metadata, original audio, and recap persisted. The device reconnected automatically and replayed the cached recap successfully.
+- Separate Play/Pause/Resume touch controls passed a hardware test using an existing saved recap. The playback position and I2S playback-frame counter stayed unchanged during pause; resuming advanced from the held position without rewinding. Repeated pause/resume, normal completion, and replay from the beginning passed, with zero new speaker errors and the original recording retained. The paused layout was inspected from the board's real framebuffer.
 - The computer did not perform Gemini processing during these standalone tests. USB was used only to issue diagnostic commands and read status; the ESP32 performed the network requests, JSON handling, SD storage, resampling, and speaker output itself.
 
 Live Gemini availability and quota depend on the configured account and service. Earlier memories remain on the card; the device UI currently opens the latest one. Each original recording is limited to 60 seconds, and each follow-up to 30 seconds. Personal Wi-Fi or a 2.4 GHz hotspot is supported; enterprise credentials and captive-portal browser login are not implemented.
