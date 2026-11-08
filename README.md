@@ -15,6 +15,8 @@ Network settings and the API key are saved in the device's NVS flash storage. Th
 
 The firmware uses the ESP certificate bundle to verify Google's HTTPS certificate and syncs its clock using NTP. It streams WAV/Base64 uploads and decodes speech downloads through a temporary SD file, avoiding extra multi-megabyte RAM copies. Gemini summaries, follow-ups, and speech run in a background task while the screen remains responsive. Cancellation stops local handling; an API request already submitted may still finish and incur usage.
 
+The standalone workflow has been tested on the physical board: direct Gemini memory generation, direct speech download and playback, saved microSD audio, and automatic Wi-Fi reconnection after restart all passed. See [VALIDATION.md](VALIDATION.md).
+
 ## Record and explore
 
 1. Power the board and connect it using the Wi-Fi setup above. The microSD card is required for standalone Gemini processing and speech downloads. The optional Windows USB bridge is described below.
