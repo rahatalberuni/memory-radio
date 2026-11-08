@@ -9,4 +9,7 @@ if((Format-GeminiFailure $failure) -notmatch '^Gemini HTTP 429 RESOURCE_EXHAUSTE
 $record.ErrorDetails=New-Object Management.Automation.ErrorDetails '{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Unsupported response schema"}}'
 $failure=Get-GeminiFailure $record
 if($failure.http_code -ne 400 -or $failure.message -ne 'Unsupported response schema'){throw 'Invalid request diagnosis failed'}
-Write-Output 'GEMINI_ERROR_TEST=PASS (HTTP details, quota reason, retry delay, credential redaction, request-error reporting)'
+$record=New-Object Management.Automation.ErrorRecord (New-Object Net.WebException 'The operation has timed out',([Net.WebExceptionStatus]::Timeout)),'TimeoutTest',([Management.Automation.ErrorCategory]::OperationTimeout),$null
+$failure=Get-GeminiFailure $record
+if($failure.http_code -ne 0 -or $failure.status -ne 'TIMEOUT'){throw 'Transport timeout classification failed'}
+Write-Output 'GEMINI_ERROR_TEST=PASS (HTTP details, quota reason, retry delay, credential redaction, request errors, network timeout classification)'
