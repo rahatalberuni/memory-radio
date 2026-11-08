@@ -18,7 +18,7 @@ bool touchOK=false,codecOK=false,audioOK=false;
 constexpr size_t MAX_SAMPLES=16000*60;
 int16_t *capture=nullptr,*original=nullptr,*reply=nullptr;
 SemaphoreHandle_t audioLock=nullptr;
-enum AudioMode {QUIET,RECORD,PLAY};
+enum AudioMode {QUIET,RECORD,PLAY,PAUSED};
 std::atomic<int> audioMode{QUIET},audioDone{QUIET};
 std::atomic<size_t> recordCount{0},playPosition{0};
 std::atomic<uint32_t> micPeak{0},micBlocks{0};
@@ -27,6 +27,7 @@ std::atomic<uint32_t> speakerPendingId{0},speakerStartedId{0},speakerFailedId{0}
 std::atomic<bool> speakerFault{false};
 int16_t speakerTone[14400];
 String loadedAudioKind="",loadedAudioMemoryId="";size_t loadedAudioSamples=0;
+int loadedAudioQuestion=-1;
 const int16_t *playBuffer=nullptr;size_t playLength=0,recordLimit=MAX_SAMPLES,originalCount=0;
 struct Item{String name,detail,quote,source;float start=0,end=0;};
 struct Memory{String title,summary,note,questions[3];Item items[3][4];int counts[3]={0,0,0};};
@@ -55,6 +56,16 @@ void wifiInit();void wifiPoll();void wifiDrawSetup();void wifiOpenSetup();void w
 
 bool online(){return wifiReady()||(lastBackend&&millis()-lastBackend<15000);}
 void stopAudio(){if(audioLock)xSemaphoreTake(audioLock,portMAX_DELAY);audioMode=QUIET;audioDone=QUIET;speakerPendingId=0;if(audioLock)xSemaphoreGive(audioLock);}
+void pauseAudio(){
+  if(audioLock)xSemaphoreTake(audioLock,portMAX_DELAY);
+  if(audioMode==PLAY&&playPosition.load()<playLength){audioMode=PAUSED;audioDone=QUIET;}
+  if(audioLock)xSemaphoreGive(audioLock);
+}
+bool resumeAudio(){
+  if(audioLock)xSemaphoreTake(audioLock,portMAX_DELAY);bool resumed=false;
+  if(audioMode==PAUSED&&playBuffer&&playPosition.load()<playLength){digitalWrite(AMP,LOW);audioMode=PLAY;resumed=true;}
+  if(audioLock)xSemaphoreGive(audioLock);return resumed;
+}
 void playPcm(const int16_t *samples,size_t count,uint32_t responseId=0){
   if(!audioOK||!samples||!count){notice="SPEAKER AUDIO IS NOT AVAILABLE.";screen=PROBLEM;if(responseId)Serial.printf("AUDIO_ERROR %u\n",responseId);return;}
   stopAudio();digitalWrite(AMP,LOW);playBuffer=samples;playLength=count;playPosition=0;speakerAckBytes=count*2;speakerPendingId=responseId;audioMode=PLAY;
@@ -113,7 +124,7 @@ void draw(){
   text(12,40,wifiReady()?"WIFI ONLINE":online()?"USB CONNECTED":"SETUP WIFI",1,online()?GREEN:DIM);
   if(screen!=RECORDING&&screen!=PROCESSING&&screen!=NETWORK_SETUP)text(175,40,"WIFI",1,CYAN);
   text(12,55,sdOK?(sdSaved?"SD: SAVED":"SD: READY"):"SD: NOT AVAILABLE",1,sdOK?GREEN:PINK);
-  text(118,55,audioMode==PLAY?"SPEAKER PLAYING":audioOK?"SPEAKER READY":"NO AUDIO",1,audioMode==PLAY?PINK:DIM);
+  text(118,55,audioMode==PLAY?"SPEAKER PLAYING":audioMode==PAUSED?"SPEAKER PAUSED":audioOK?"SPEAKER READY":"NO AUDIO",1,audioMode==PLAY?PINK:audioMode==PAUSED?GREEN:DIM);
   if(screen!=HOME&&screen!=RECORDING&&screen!=PROCESSING&&screen!=NETWORK_SETUP){text(211,40,"HOME",1,DIM);}
   if(screen==NETWORK_SETUP){wifiDrawSetup();}
   else if(screen==HOME){
@@ -132,7 +143,7 @@ void draw(){
     drawRadio();wrapped(20,195,busyLabel,33,3,CYAN);text(20,249,"YOUR RECORDING IS STILL SAFE",1,DIM);btn(12,278,216,"CANCEL",DIM);
   }else if(screen==SUMMARY){
     wrapped(16,65,memory.title,34,2,CYAN);bodyPages(memory.summary+(memory.note.length()?"  UNCLEAR: "+memory.note:""));
-    btn(12,238,102,"QUESTIONS",GREEN);btn(126,238,102,audioMode==PLAY?"STOP AUDIO":"PLAY AI AUDIO",PINK);tabs();
+    btn(8,238,68,"QUESTIONS",GREEN);btn(86,238,68,audioMode==PAUSED?"RESUME":"PLAY",CYAN);btn(164,238,68,"PAUSE",audioMode==PLAY?PINK:DIM);tabs();
   }else if(screen==LIST){
     const char *names[]={"PEOPLE IN YOUR STORY","PLACES YOU REMEMBER","YOUR MEMORY TIMELINE"};text(16,68,names[category],1,CYAN);
     for(int i=0;i<memory.counts[category];i++){int y=88+i*35;panel(12,y,216,32);wrapped(22,y+6,memory.items[category][i].name,32,2,WHITE);}
@@ -148,7 +159,7 @@ void draw(){
     btn(12,278,216,"BACK TO STORY",DIM);
   }else if(screen==QUESTION){
     text(16,68,"ONE MORE DETAIL",1,CYAN);wrapped(18,96,memory.questions[questionIndex],34,8,WHITE);
-    btn(12,198,216,"HEAR QUESTION",CYAN);btn(12,238,216,"RECORD MY ANSWER",GREEN);btn(12,278,216,"BACK",DIM);
+    btn(12,198,102,audioMode==PAUSED?"RESUME":"PLAY QUESTION",CYAN);btn(126,198,102,"PAUSE",audioMode==PLAY?PINK:DIM);btn(12,238,216,"RECORD MY ANSWER",GREEN);btn(12,278,216,"BACK",DIM);
   }else{
     text(16,75,"LET'S TRY AGAIN",2,PINK);wrapped(18,111,notice,34,7,WHITE);
     btn(12,238,216,originalCount?"BACK TO MY RECORDING":"BACK HOME",GREEN);btn(12,278,216,"HOME",DIM);
@@ -201,13 +212,22 @@ void request(const char *kind,int a=0,int b=0){
 }
 void playAiAudio(){
   if(wifiBusy())return;
-  if(audioMode==PLAY){stopAudio();return;}
   if(!audioOK){problem("THE SPEAKER AUDIO DRIVER IS NOT READY. TRY TEST SPEAKER ON THE HOME SCREEN.");return;}
+  if(loadedAudioKind=="NARRATE"&&loadedAudioMemoryId==memoryId&&playBuffer==reply){if(audioMode==PAUSED){resumeAudio();return;}if(audioMode==PLAY)return;}
   if(loadedAudioKind=="NARRATE"&&loadedAudioMemoryId==memoryId&&loadedAudioSamples){playPcm(reply,loadedAudioSamples);return;}
   stopAudio();size_t count=loadWav("recap",reply);
   if(count){loadedAudioKind="NARRATE";loadedAudioMemoryId=memoryId;loadedAudioSamples=count;playPcm(reply,count);return;}
   if(online()){request("NARRATE");return;}
-  problem("NO AI AUDIO SAVED YET. CONNECT WIFI, OPEN YOUR SUMMARY, THEN TAP PLAY AI AUDIO.");
+  problem("NO AI AUDIO SAVED YET. CONNECT WIFI, OPEN YOUR SUMMARY, THEN TAP PLAY.");
+}
+void playQuestionAudio(){
+  if(wifiBusy())return;
+  bool same=loadedAudioKind=="QUESTION"&&loadedAudioMemoryId==memoryId&&loadedAudioQuestion==questionIndex;
+  if(same&&playBuffer==reply){if(audioMode==PAUSED){resumeAudio();return;}if(audioMode==PLAY)return;}
+  if(same&&loadedAudioSamples){playPcm(reply,loadedAudioSamples);return;}
+  stopAudio();size_t count=loadWav("question"+String(questionIndex),reply);
+  if(count){loadedAudioKind="QUESTION";loadedAudioMemoryId=memoryId;loadedAudioQuestion=questionIndex;loadedAudioSamples=count;playPcm(reply,count);return;}
+  request("QUESTION",questionIndex);
 }
 void cancelWait(){wifiCancelJob();waiting=false;uploadActive=false;requestId++;receiveValid=false;screen=returnScreen;Serial.println("CANCEL");}
 void handleTouch(int x,int y){
@@ -222,12 +242,12 @@ void handleTouch(int x,int y){
   else if(screen==PROCESSING){if(y>=278)cancelWait();}
   else if(screen==SUMMARY||screen==LIST){
     if(y>=278){stopAudio();int t=constrain((x-8)/58,0,3);page=0;if(t==0)screen=SUMMARY;else{category=t-1;screen=LIST;}return;}
-    if(y>=238&&y<270){if(screen==LIST||x<120){screen=QUESTIONS;}else{playAiAudio();}return;}
+    if(y>=238&&y<270){if(screen==LIST||x<80){screen=QUESTIONS;}else if(x<160){playAiAudio();}else{pauseAudio();}return;}
     if(screen==SUMMARY&&y>=212&&y<233){page+=x<120?-1:1;page=max(0,page);}
     if(screen==LIST&&y>=88&&y<228){int i=(y-88)/35;if(i<memory.counts[category]){itemIndex=i;page=0;screen=DETAIL;}}
   }else if(screen==DETAIL){if(y>=212&&y<233){page=max(0,page+(x<120?-1:1));}else if(y>=238&&y<270){if(online())request("EXCERPT",category,itemIndex);else{Item &item=memory.items[category][itemIndex];const int16_t *data=original;size_t count=originalCount;if(item.source!="story"){count=loadWav(item.source,reply);data=reply;}size_t start=(size_t)(max(0.0f,item.start-0.4f)*16000),end=min(count,(size_t)((item.end+0.4f)*16000));if(end>start)playPcm(data+start,end-start);}}else if(y>=278){stopAudio();screen=LIST;}}
   else if(screen==QUESTIONS){if(y>=87&&y<249){int q=(y-87)/54;if(q<3){questionIndex=q;screen=QUESTION;}}else if(y>=278){screen=SUMMARY;page=0;}}
-  else if(screen==QUESTION){if(y>=198&&y<230)request("QUESTION",questionIndex);else if(y>=238&&y<270)beginRecord(true);else if(y>=278){stopAudio();screen=QUESTIONS;}}
+  else if(screen==QUESTION){if(y>=198&&y<230){if(x<120)playQuestionAudio();else pauseAudio();}else if(y>=238&&y<270)beginRecord(true);else if(y>=278){stopAudio();screen=QUESTIONS;}}
   else if(screen==PROBLEM){if(y>=238&&y<270)screen=originalCount?REVIEW:HOME;else if(y>=278)screen=HOME;}
 }
 void touchPoll(){static bool down=false;static int x=0,y=0;if(!touchOK)return;int count=regRead(0x38,2);if(count<0)return;bool touched=count>0&&count<3;
@@ -254,6 +274,8 @@ void serialCommand(String line){
   else if(line=="SPEAKER_TEST")testSpeaker();
   else if(line=="SPEAKER_STREAM_TEST"&&!waiting)request("SPEAKER_CHECK");
   else if(line=="PLAY_AI"&&hasMemory)playAiAudio();
+  else if(line=="PAUSE")pauseAudio();
+  else if(line=="RESUME")resumeAudio();
   else if(line=="LOAD_SD")loadSD();
   else if(line=="SD_LIST")listSD();
   else if(line=="SD_VERIFY")verifySD();
@@ -283,7 +305,7 @@ void serialCommand(String line){
     if(bytes==0||bytes>MAX_SAMPLES*2||bytes%2){if(waiting&&id==requestId)problem("INVALID AUDIO RESPONSE.");return;}
     receiveLength=bytes;receiveCount=0;receiveId=id;receiveValid=waiting&&id==requestId;receiveStarted=millis();stopAudio();
   }else if(sscanf(line.c_str(),"AUDIO_OUT_END %u",&id)==1){
-    if(receiveValid&&receiveCount==receiveLength&&id==receiveId&&waiting&&id==requestId){waiting=false;screen=returnScreen;String audioName=requestKind=="NARRATE"?"recap":requestKind=="QUESTION"?"question"+String(questionIndex):requestKind=="SPEAKER_CHECK"?"speaker-test":"excerpt-"+String(category)+"-"+String(itemIndex);sdSaved=saveAudio(audioName,reply,receiveLength/2);loadedAudioKind=requestKind;loadedAudioMemoryId=memoryId;loadedAudioSamples=receiveLength/2;playPcm(reply,receiveLength/2,id);lastBackend=millis();}
+    if(receiveValid&&receiveCount==receiveLength&&id==receiveId&&waiting&&id==requestId){waiting=false;screen=returnScreen;String audioName=requestKind=="NARRATE"?"recap":requestKind=="QUESTION"?"question"+String(questionIndex):requestKind=="SPEAKER_CHECK"?"speaker-test":"excerpt-"+String(category)+"-"+String(itemIndex);sdSaved=saveAudio(audioName,reply,receiveLength/2);loadedAudioKind=requestKind;loadedAudioMemoryId=memoryId;loadedAudioQuestion=requestKind=="QUESTION"?questionIndex:-1;loadedAudioSamples=receiveLength/2;playPcm(reply,receiveLength/2,id);lastBackend=millis();}
     receiveValid=false;receiveLength=0;receiveCount=0;
   }
 }
