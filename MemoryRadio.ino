@@ -22,6 +22,11 @@ enum AudioMode {QUIET,RECORD,PLAY};
 std::atomic<int> audioMode{QUIET},audioDone{QUIET};
 std::atomic<size_t> recordCount{0},playPosition{0};
 std::atomic<uint32_t> micPeak{0},micBlocks{0};
+std::atomic<uint32_t> speakerFrames{0},speakerNonzeroFrames{0},speakerErrors{0},speakerPeak{0};
+std::atomic<uint32_t> speakerPendingId{0},speakerStartedId{0},speakerFailedId{0},speakerAckBytes{0};
+std::atomic<bool> speakerFault{false};
+int16_t speakerTone[14400];
+String loadedAudioKind="",loadedAudioMemoryId="";size_t loadedAudioSamples=0;
 const int16_t *playBuffer=nullptr;size_t playLength=0,recordLimit=MAX_SAMPLES,originalCount=0;
 struct Item{String name,detail,quote,source;float start=0,end=0;};
 struct Memory{String title,summary,note,questions[3];Item items[3][4];int counts[3]={0,0,0};};
@@ -47,15 +52,27 @@ void stopAudio();
 #include "storage.h"
 
 bool online(){return lastBackend&&millis()-lastBackend<15000;}
-void stopAudio(){if(audioLock)xSemaphoreTake(audioLock,portMAX_DELAY);audioMode=QUIET;audioDone=QUIET;if(audioLock)xSemaphoreGive(audioLock);}
-void playPcm(const int16_t *samples,size_t count){if(!audioOK||!count)return;stopAudio();playBuffer=samples;playLength=count;playPosition=0;audioMode=PLAY;}
+void stopAudio(){if(audioLock)xSemaphoreTake(audioLock,portMAX_DELAY);audioMode=QUIET;audioDone=QUIET;speakerPendingId=0;if(audioLock)xSemaphoreGive(audioLock);}
+void playPcm(const int16_t *samples,size_t count,uint32_t responseId=0){
+  if(!audioOK||!samples||!count){notice="SPEAKER AUDIO IS NOT AVAILABLE.";screen=PROBLEM;if(responseId)Serial.printf("AUDIO_ERROR %u\n",responseId);return;}
+  stopAudio();digitalWrite(AMP,LOW);playBuffer=samples;playLength=count;playPosition=0;speakerAckBytes=count*2;speakerPendingId=responseId;audioMode=PLAY;
+}
+void testSpeaker(){
+  if(waiting||screen==RECORDING)return;stopAudio();
+  for(int i=0;i<14400;i++){int part=i/4800,local=i%4800;float envelope=min(1.0f,min(local/160.0f,(4800-local)/160.0f));float sample=local<4000?sinf(2*PI*(part==0?523:part==1?659:784)*local/16000)*5000*envelope:0;speakerTone[i]=(int16_t)sample;}
+  playPcm(speakerTone,14400);Serial.println("SPEAKER_TEST_STARTED three_tones=1");
+}
 void audioTask(void*){
   int16_t tx[512],rx[256];
   for(;;){
     xSemaphoreTake(audioLock,portMAX_DELAY);int mode=audioMode.load();size_t pos=playPosition.load();
     for(int i=0;i<256;i++){int16_t v=(mode==PLAY&&pos<playLength)?playBuffer[pos++]:0;tx[2*i]=tx[2*i+1]=v;}
     if(mode==PLAY)playPosition=pos;
-    audio.write((uint8_t*)tx,sizeof(tx));size_t n=audio.readBytes((char*)rx,sizeof(rx))/2;
+    size_t written=audio.write((uint8_t*)tx,sizeof(tx));
+    if(mode==PLAY){uint32_t peak=0;for(int i=0;i<512;i++)peak=max(peak,(uint32_t)abs((int)tx[i]));speakerPeak=peak;
+      if(written==sizeof(tx)){speakerFrames++;if(peak)speakerNonzeroFrames++;uint32_t id=speakerPendingId.exchange(0);if(id)speakerStartedId=id;}
+      else{speakerErrors++;speakerFault=true;speakerFailedId=speakerPendingId.exchange(0);audioMode=QUIET;}}
+    size_t n=audio.readBytes((char*)rx,sizeof(rx))/2;
     uint32_t peak=0;for(size_t i=0;i<n;i++)peak=max(peak,(uint32_t)abs((int)rx[i]));micPeak=peak;micBlocks++;
     if(mode==RECORD&&n){size_t used=recordCount.load(),take=min(n,recordLimit-used);memcpy(capture+used,rx,take*2);recordCount=used+take;if(used+take>=recordLimit){audioMode=QUIET;audioDone=RECORD;}}
     else if(mode==PLAY&&pos>=playLength){audioMode=QUIET;audioDone=PLAY;}
@@ -87,15 +104,16 @@ void drawRadio(){
   panel(39,69,162,115);rect(54,84,103,25,BG);for(int i=0;i<11;i++)rect(60+i*8,91,2,11,DIM);
   circle(178,97,10,CYAN);circle(178,97,4,CARD);
   for(int i=0;i<8;i++){int h=8+(int)(10+9*sinf(i*1.6f+millis()/550.0f));rect(59+i*16,137-h/2,5,h,i%2?PINK:CYAN);}
-  rect(151,56,3,17,DIM);rect(154,52,31,3,DIM);
+  rect(151,65,3,17,DIM);rect(154,63,31,3,DIM);
 }
 void draw(){
   rect(0,0,W,H,BG);text(12,14,"MEMORY",2,WHITE);text(97,14,"RADIO",2,CYAN);
   text(12,40,online()?"GEMINI CONNECTED":"CONNECT USB + GEMINI",1,online()?GREEN:DIM);
   text(12,55,sdOK?(sdSaved?"SD: SAVED":"SD: READY"):"SD: NOT AVAILABLE",1,sdOK?GREEN:PINK);
+  text(118,55,audioMode==PLAY?"SPEAKER PLAYING":audioOK?"SPEAKER READY":"NO AUDIO",1,audioMode==PLAY?PINK:DIM);
   if(screen!=HOME&&screen!=RECORDING&&screen!=PROCESSING){text(211,40,"HOME",1,DIM);}
   if(screen==HOME){
-    drawRadio();wrapped(22,193,"YOUR VOICE. YOUR PEOPLE. YOUR STORY.",33,2,DIM);
+    drawRadio();btn(12,190,216,audioMode==PLAY?"STOP SPEAKER":"TEST SPEAKER",PINK);
     btn(12,231,216,"RECORD A MEMORY",GREEN);btn(12,274,216,hasMemory?"EXPLORE YOUR MEMORY":"OPEN LATEST SAVED",CYAN);
   }else if(screen==RECORDING){
     wrapped(18,67,followup?recordPrompt:"TELL ME ABOUT A MOMENT YOU WANT TO REMEMBER.",34,4,DIM);
@@ -110,7 +128,7 @@ void draw(){
     drawRadio();wrapped(20,195,busyLabel,33,3,CYAN);text(20,249,"YOUR RECORDING IS STILL SAFE",1,DIM);btn(12,278,216,"CANCEL",DIM);
   }else if(screen==SUMMARY){
     wrapped(16,65,memory.title,34,2,CYAN);bodyPages(memory.summary+(memory.note.length()?"  UNCLEAR: "+memory.note:""));
-    btn(12,238,102,"QUESTIONS",GREEN);btn(126,238,102,audioMode==PLAY?"STOP":online()?"NARRATE":"PLAY AUDIO",PINK);tabs();
+    btn(12,238,102,"QUESTIONS",GREEN);btn(126,238,102,audioMode==PLAY?"STOP AUDIO":"PLAY AI AUDIO",PINK);tabs();
   }else if(screen==LIST){
     const char *names[]={"PEOPLE IN YOUR STORY","PLACES YOU REMEMBER","YOUR MEMORY TIMELINE"};text(16,68,names[category],1,CYAN);
     for(int i=0;i<memory.counts[category];i++){int y=88+i*35;panel(12,y,216,32);wrapped(22,y+6,memory.items[category][i].name,32,2,WHITE);}
@@ -174,17 +192,26 @@ void request(const char *kind,int a=0,int b=0){
   beginWait(String(kind)=="LOAD"?"OPENING YOUR LAST SAVED MEMORY...":String(kind)=="EXCERPT"?"FINDING THAT MOMENT IN YOUR ORIGINAL VOICE...":"GEMINI IS PREPARING YOUR NARRATION...",previous);
   requestKind=kind;Serial.printf("REQUEST %u %s %d %d %s\n",requestId,kind,a,b,memoryId.length()?memoryId.c_str():"LATEST");
 }
+void playAiAudio(){
+  if(audioMode==PLAY){stopAudio();return;}
+  if(!audioOK){problem("THE SPEAKER AUDIO DRIVER IS NOT READY. TRY TEST SPEAKER ON THE HOME SCREEN.");return;}
+  if(loadedAudioKind=="NARRATE"&&loadedAudioMemoryId==memoryId&&loadedAudioSamples){playPcm(reply,loadedAudioSamples);return;}
+  stopAudio();size_t count=loadWav("recap",reply);
+  if(count){loadedAudioKind="NARRATE";loadedAudioMemoryId=memoryId;loadedAudioSamples=count;playPcm(reply,count);return;}
+  if(online()){request("NARRATE");return;}
+  problem("NO AI AUDIO SAVED YET. CONNECT GEMINI, OPEN YOUR SUMMARY, THEN TAP PLAY AI AUDIO.");
+}
 void cancelWait(){waiting=false;uploadActive=false;requestId++;receiveValid=false;screen=returnScreen;Serial.println("CANCEL");}
 void handleTouch(int x,int y){
   Serial.printf("TOUCH %d %d\n",x,y);
   if(screen!=RECORDING&&screen!=PROCESSING&&screen!=HOME&&y>=30&&y<55&&x>205){stopAudio();screen=HOME;return;}
-  if(screen==HOME){if(y>=231&&y<263)beginRecord();else if(y>=274&&y<306){if(hasMemory){screen=SUMMARY;page=0;}else if(originalCount){screen=REVIEW;}else if(!loadSD())request("LOAD");}}
+  if(screen==HOME){if(y>=190&&y<222){if(audioMode==PLAY)stopAudio();else testSpeaker();}else if(y>=231&&y<263)beginRecord();else if(y>=274&&y<306){if(hasMemory){screen=SUMMARY;page=0;}else if(originalCount){screen=REVIEW;}else if(!loadSD())request("LOAD");}}
   else if(screen==RECORDING){if(y>=237&&y<269)finishRecord();else if(y>=278){stopAudio();screen=followup?QUESTION:HOME;}}
   else if(screen==REVIEW){if(y>=177&&y<209){if(audioMode==PLAY)stopAudio();else playPcm(original,originalCount);}else if(y>=220&&y<252)uploadAudio(false);else if(y>=278)beginRecord();}
   else if(screen==PROCESSING){if(y>=278)cancelWait();}
   else if(screen==SUMMARY||screen==LIST){
     if(y>=278){stopAudio();int t=constrain((x-8)/58,0,3);page=0;if(t==0)screen=SUMMARY;else{category=t-1;screen=LIST;}return;}
-    if(y>=238&&y<270){if(screen==LIST||x<120){screen=QUESTIONS;}else{if(audioMode==PLAY)stopAudio();else if(online())request("NARRATE");else{size_t count=loadWav("recap",reply);if(count)playPcm(reply,count);else playPcm(original,originalCount);}}return;}
+    if(y>=238&&y<270){if(screen==LIST||x<120){screen=QUESTIONS;}else{playAiAudio();}return;}
     if(screen==SUMMARY&&y>=212&&y<233){page+=x<120?-1:1;page=max(0,page);}
     if(screen==LIST&&y>=88&&y<228){int i=(y-88)/35;if(i<memory.counts[category]){itemIndex=i;page=0;screen=DETAIL;}}
   }else if(screen==DETAIL){if(y>=212&&y<233){page=max(0,page+(x<120?-1:1));}else if(y>=238&&y<270){if(online())request("EXCERPT",category,itemIndex);else{Item &item=memory.items[category][itemIndex];const int16_t *data=original;size_t count=originalCount;if(item.source!="story"){count=loadWav(item.source,reply);data=reply;}size_t start=(size_t)(max(0.0f,item.start-0.4f)*16000),end=min(count,(size_t)((item.end+0.4f)*16000));if(end>start)playPcm(data+start,end-start);}}else if(y>=278){stopAudio();screen=LIST;}}
@@ -196,7 +223,7 @@ void touchPoll(){static bool down=false;static int x=0,y=0;if(!touchOK)return;in
   if(touched&&!down){Wire.beginTransmission(0x38);Wire.write(3);if(Wire.endTransmission(false)!=0)return;if(Wire.requestFrom((uint8_t)0x38,(size_t)4)!=4)return;x=(Wire.read()&15)<<8;x|=Wire.read();y=(Wire.read()&15)<<8;y|=Wire.read();down=true;}
   else if(!touched&&down){down=false;if(x>=0&&x<W&&y>=0&&y<H)handleTouch(x,y);}
 }
-void status(){Serial.printf("STATUS screen=%d touch=%d codec=%d audio=%d psram=%u heap=%u mic=%u blocks=%u original=%u recording=%u mode=%d memory=%d people=%d places=%d events=%d waiting=%d request=%u backend=%d frames=%u sd=%d saved=%d id=%s\n",screen,touchOK,codecOK,audioOK,ESP.getPsramSize(),ESP.getFreeHeap(),micPeak.load(),micBlocks.load(),(unsigned)originalCount,(unsigned)recordCount.load(),audioMode.load(),hasMemory,memory.counts[0],memory.counts[1],memory.counts[2],waiting,requestId,online(),frames,sdOK,sdSaved,memoryId.c_str());}
+void status(){Serial.printf("STATUS screen=%d touch=%d codec=%d audio=%d psram=%u heap=%u mic=%u blocks=%u original=%u recording=%u mode=%d memory=%d people=%d places=%d events=%d waiting=%d request=%u backend=%d frames=%u sd=%d saved=%d id=%s speakerFrames=%u speakerNonzero=%u speakerErrors=%u speakerPeak=%u amplifier=%d playPosition=%u playLength=%u\n",screen,touchOK,codecOK,audioOK,ESP.getPsramSize(),ESP.getFreeHeap(),micPeak.load(),micBlocks.load(),(unsigned)originalCount,(unsigned)recordCount.load(),audioMode.load(),hasMemory,memory.counts[0],memory.counts[1],memory.counts[2],waiting,requestId,online(),frames,sdOK,sdSaved,memoryId.c_str(),speakerFrames.load(),speakerNonzeroFrames.load(),speakerErrors.load(),speakerPeak.load(),digitalRead(AMP)==LOW,(unsigned)playPosition.load(),(unsigned)playLength);}
 void serialCommand(String line){
   line.trim();unsigned id=0;int a=0,b=0;size_t bytes=0;
   if(line=="READY"){lastBackend=millis();}
@@ -210,6 +237,9 @@ void serialCommand(String line){
   else if(line=="ANALYZE"&&screen==REVIEW)uploadAudio(false);
   else if(line=="ANALYZE_SAVED"&&originalCount>0&&!waiting)uploadAudio(false);
   else if(line=="PLAY")playPcm(original,originalCount);
+  else if(line=="SPEAKER_TEST")testSpeaker();
+  else if(line=="SPEAKER_STREAM_TEST"&&!waiting)request("SPEAKER_CHECK");
+  else if(line=="PLAY_AI"&&hasMemory)playAiAudio();
   else if(line=="LOAD_SD")loadSD();
   else if(line=="SD_LIST")listSD();
   else if(line=="SD_VERIFY")verifySD();
@@ -232,14 +262,14 @@ void serialCommand(String line){
       pending.items[a][b]={decode(fields[3],100),decode(fields[4],500),decode(fields[5],300),decode(fields[6],30),fields[7].toFloat(),fields[8].toFloat()};pending.counts[a]=max(pending.counts[a],b+1);
     }
   }else if(sscanf(line.c_str(),"DONE %u",&id)==1){
-    if(waiting&&id==requestId){if(!pending.title.length()||!pending.summary.length()){problem("GEMINI RETURNED AN INCOMPLETE MEMORY. PLEASE TRY AGAIN.");return;}memory=pending;hasMemory=true;waiting=false;screen=SUMMARY;page=0;if(!restoringSD){lastBackend=millis();sdSaved=saveMetadata();}}
+    if(waiting&&id==requestId){if(!pending.title.length()||!pending.summary.length()){problem("GEMINI RETURNED AN INCOMPLETE MEMORY. PLEASE TRY AGAIN.");return;}bool changed=memory.summary!=pending.summary;memory=pending;hasMemory=true;waiting=false;screen=SUMMARY;page=0;if(!restoringSD){if(changed){loadedAudioKind="";loadedAudioSamples=0;if(sdOK&&SD_MMC.exists(memoryFolder+"/recap.wav"))SD_MMC.rename(memoryFolder+"/recap.wav",memoryFolder+"/recap-previous-"+String(millis())+".wav");}lastBackend=millis();sdSaved=saveMetadata();}}
   }else if(line.startsWith("ERROR ")){
     int split=line.indexOf(' ',6);id=line.substring(6,split).toInt();if(waiting&&id==requestId)problem(decode(line.substring(split+1)));
   }else if(sscanf(line.c_str(),"AUDIO_OUT %u %u",&id,(unsigned*)&bytes)==2){
     if(bytes==0||bytes>MAX_SAMPLES*2||bytes%2){if(waiting&&id==requestId)problem("INVALID AUDIO RESPONSE.");return;}
     receiveLength=bytes;receiveCount=0;receiveId=id;receiveValid=waiting&&id==requestId;receiveStarted=millis();stopAudio();
   }else if(sscanf(line.c_str(),"AUDIO_OUT_END %u",&id)==1){
-    if(receiveValid&&receiveCount==receiveLength&&id==receiveId&&waiting&&id==requestId){waiting=false;screen=returnScreen;String audioName=requestKind=="NARRATE"?"recap":requestKind=="QUESTION"?"question"+String(questionIndex):"excerpt-"+String(category)+"-"+String(itemIndex);sdSaved=saveAudio(audioName,reply,receiveLength/2);playPcm(reply,receiveLength/2);lastBackend=millis();}
+    if(receiveValid&&receiveCount==receiveLength&&id==receiveId&&waiting&&id==requestId){waiting=false;screen=returnScreen;String audioName=requestKind=="NARRATE"?"recap":requestKind=="QUESTION"?"question"+String(questionIndex):requestKind=="SPEAKER_CHECK"?"speaker-test":"excerpt-"+String(category)+"-"+String(itemIndex);sdSaved=saveAudio(audioName,reply,receiveLength/2);loadedAudioKind=requestKind;loadedAudioMemoryId=memoryId;loadedAudioSamples=receiveLength/2;playPcm(reply,receiveLength/2,id);lastBackend=millis();}
     receiveValid=false;receiveLength=0;receiveCount=0;
   }
 }
@@ -268,6 +298,8 @@ void setup(){
 }
 void loop(){
   if(!fb){delay(1000);return;}serialPoll();touchPoll();uploadPoll();int done=audioDone.exchange(QUIET);if(done==RECORD&&screen==RECORDING)finishRecord();
+  uint32_t playingId=speakerStartedId.exchange(0);if(playingId)Serial.printf("AUDIO_PLAYING %u %u\n",playingId,speakerAckBytes.load());
+  if(speakerFault.exchange(false)){uint32_t failed=speakerFailedId.exchange(0);if(failed)Serial.printf("AUDIO_ERROR %u\n",failed);problem("SPEAKER OUTPUT FAILED. PLEASE RESTART THE DEVICE AND TRY TEST SPEAKER.");}
   if(waiting&&millis()-waitStart>150000){waiting=false;requestId++;problem("GEMINI TOOK TOO LONG. YOUR RECORDING IS AVAILABLE TO RETRY.");}
   static uint32_t lastFrame=0;if(millis()-lastFrame>=100){lastFrame=millis();draw();}delay(3);
 }
