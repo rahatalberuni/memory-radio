@@ -5,7 +5,7 @@ $sdk='C:/Users/alber/AppData/Local/Arduino15/packages/esp32/tools/esp32s3-libs/3
 $bin='C:/Users/alber/AppData/Local/Arduino15/packages/esp32/tools/esp-x32/2601/bin'
 $build=($root+'/build').Replace('\','/')
 New-Item -ItemType Directory -Path $build -Force | Out-Null
-$libNames=@('Wire','SPI','ESP_I2S','FS','SD_MMC')
+$libNames=@('Wire','SPI','ESP_I2S','FS','SD_MMC','Network','WiFi','WebServer','Preferences','Hash')
 $includes=@("$platform/cores/esp32", "$platform/variants/esp32s3", "$root")
 foreach($lib in $libNames){$includes += "$platform/libraries/$lib/src"}
 $defs=@('-DF_CPU=240000000L','-DARDUINO=10607','-DARDUINO_ESP32S3_DEV','-DARDUINO_ARCH_ESP32','-DARDUINO_BOARD=\"ESP32S3_DEV\"','-DARDUINO_VARIANT=\"esp32s3\"','-DARDUINO_PARTITION_esp_sr_16','-DBOARD_HAS_PSRAM','-DESP32=ESP32','-DCORE_DEBUG_LEVEL=0','-DARDUINO_USB_MODE=1','-DARDUINO_USB_CDC_ON_BOOT=1','-DARDUINO_USB_MSC_ON_BOOT=0','-DARDUINO_USB_DFU_ON_BOOT=0','-DARDUINO_RUNNING_CORE=1','-DARDUINO_EVENT_RUNNING_CORE=1')
