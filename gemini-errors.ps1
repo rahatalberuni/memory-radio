@@ -21,6 +21,14 @@ function Get-GeminiFailure($Record,[string]$Secret=''){
   $message=[regex]::Replace($message,'AIza[0-9A-Za-z_-]{20,}','[REDACTED]')
   $message=[regex]::Replace($message,'(?i)([?&]key=)[^\s&"'']+','$1[REDACTED]')
   $message=[regex]::Replace($message,'\s+',' ').Trim()
+  if(!$code){
+    $cause=$Record.Exception;$timedOut=$false
+    while($cause){
+      if($cause -is [TimeoutException] -or ($cause -is [Net.WebException] -and $cause.Status -eq [Net.WebExceptionStatus]::Timeout)){$timedOut=$true}
+      $cause=$cause.InnerException
+    }
+    if($timedOut -or $message -match '(?i)\btimed out\b|\btimeout\b'){$status='TIMEOUT'}
+  }
   if($message.Length -gt 3500){$message=$message.Substring(0,3500)}
   return [pscustomobject]@{http_code=$code;status=$status;message=$message;retry_delay=$retry}
 }
