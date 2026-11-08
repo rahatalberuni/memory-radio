@@ -53,6 +53,7 @@ bool loadSD(){
 }
 void listSD(){if(!sdOK){Serial.println("SD_NOT_AVAILABLE");return;}File dir=SD_MMC.open(memoryFolder.length()?memoryFolder:"/memory-radio");for(File f=dir.openNextFile();f;f=dir.openNextFile()){Serial.printf("SD_FILE %s %u\n",f.name(),(unsigned)f.size());f.close();}dir.close();}
 size_t loadWav(const String &name,int16_t *target){
+  if(target==reply){loadedAudioKind="";loadedAudioSamples=0;}
   if(!sdOK||!name.length())return 0;for(size_t i=0;i<name.length();i++)if(!isalnum(name[i])&&name[i]!='-')return 0;
   File f=SD_MMC.open(memoryFolder+"/"+name+".wav",FILE_READ);if(!f)return 0;
   uint8_t h[44];if(f.read(h,44)!=44||memcmp(h,"RIFF",4)||memcmp(h+36,"data",4)){f.close();return 0;}
