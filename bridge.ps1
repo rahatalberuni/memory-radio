@@ -171,6 +171,21 @@ function Send-Audio([string]$Id,[byte[]]$Pcm){
   $serial.WriteLine("AUDIO_OUT $Id $($Pcm.Length)")
   for($at=0;$at -lt $Pcm.Length;$at+=1024){$serial.Write($Pcm,$at,[Math]::Min(1024,$Pcm.Length-$at));[Threading.Thread]::Sleep(5)}
   $serial.WriteLine('');$serial.WriteLine("AUDIO_OUT_END $Id");$serial.WriteLine('READY')
+  $serial.ReadTimeout=10000
+  try{
+    $confirmed=$false;$until=[DateTime]::UtcNow.AddSeconds(10)
+    while([DateTime]::UtcNow -lt $until){
+      $ack=$serial.ReadLine().Trim()
+      if($ack -eq "AUDIO_PLAYING $Id $($Pcm.Length)"){$confirmed=$true;break}
+      if($ack -eq "AUDIO_ERROR $Id"){throw 'The ESP32 audio driver could not start speaker playback. Use TEST SPEAKER on the device.'}
+    }
+    if(!$confirmed){throw 'The ESP32 did not confirm speaker playback. Check the device and use TEST SPEAKER.'}
+    Write-Host 'ESP32 speaker playback started.'
+  }catch{
+    $cause=$_.Exception;while($cause.InnerException){$cause=$cause.InnerException}
+    if($cause -is [TimeoutException]){throw 'USB speaker confirmation timed out. The ESP32 did not acknowledge audio playback; try TEST SPEAKER on the home screen.'}
+    throw
+  }finally{$serial.ReadTimeout=1000}
 }
 function Narrate([string]$Text){
   if(!$VoiceModel){throw 'This API key has no supported speech-generation model. The text memory and original audio still work.'}
@@ -261,8 +276,10 @@ For a follow-up: update the existing memory with newly stated details, preserve 
           $clip=New-Object byte[] ($end-$start);[Array]::Copy($wav.Pcm,$start,$clip,0,$clip.Length);[byte[]]$speech=Resample $clip $wav.Rate
         }else{
           $text=if($kind -eq 'NARRATE'){$memory.summary}else{$memory.questions[$a]}
-          [byte[]]$speech=Narrate $text
-          [IO.File]::WriteAllBytes((Join-Path $folder ($kind.ToLower()+'-'+$id+'.wav')),(To-Wav $speech))
+          $cache=$null
+          if($kind -eq 'NARRATE'){$metadata=Get-Item -LiteralPath $path;$cache=Get-ChildItem -LiteralPath $folder -Filter 'narrate-*.wav' -File|Where-Object {$_.LastWriteTimeUtc -ge $metadata.LastWriteTimeUtc}|Sort-Object LastWriteTimeUtc -Descending|Select-Object -First 1}
+          if($cache){$cached=Read-PcmWav ([IO.File]::ReadAllBytes($cache.FullName));[byte[]]$speech=Resample $cached.Pcm $cached.Rate;Write-Host 'Replaying the saved AI recap without a new Gemini request.'}
+          else{[byte[]]$speech=Narrate $text;[IO.File]::WriteAllBytes((Join-Path $folder ($kind.ToLower()+'-'+$id+'.wav')),(To-Wav $speech))}
         }
         Send-Audio $id $speech;Write-Output "$kind audio delivered."
       }
