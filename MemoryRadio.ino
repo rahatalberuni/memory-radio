@@ -31,7 +31,7 @@ const int16_t *playBuffer=nullptr;size_t playLength=0,recordLimit=MAX_SAMPLES,or
 struct Item{String name,detail,quote,source;float start=0,end=0;};
 struct Memory{String title,summary,note,questions[3];Item items[3][4];int counts[3]={0,0,0};};
 Memory memory,pending;bool hasMemory=false;
-enum Screen {HOME,RECORDING,REVIEW,PROCESSING,SUMMARY,LIST,DETAIL,QUESTIONS,QUESTION,PROBLEM};
+enum Screen {HOME,RECORDING,REVIEW,PROCESSING,SUMMARY,LIST,DETAIL,QUESTIONS,QUESTION,PROBLEM,NETWORK_SETUP};
 Screen screen=HOME,returnScreen=SUMMARY;
 int category=0,itemIndex=0,questionIndex=0,page=0;
 int answerNumber=0;
@@ -49,9 +49,11 @@ bool sdOK=false,sdSaved=false,restoringSD=false;
 String memoryId="",memoryFolder="",requestKind="";
 void serialCommand(String line);
 void stopAudio();
+bool wifiReady();bool wifiBusy();bool wifiStartJob(const String &kind,int a=0,int b=0,const int16_t *pcm=nullptr,size_t samples=0);
+void wifiInit();void wifiPoll();void wifiDrawSetup();void wifiOpenSetup();void wifiCloseSetup();void wifiCancelJob();void wifiStatus();bool wifiSelfTest();
 #include "storage.h"
 
-bool online(){return lastBackend&&millis()-lastBackend<15000;}
+bool online(){return wifiReady()||(lastBackend&&millis()-lastBackend<15000);}
 void stopAudio(){if(audioLock)xSemaphoreTake(audioLock,portMAX_DELAY);audioMode=QUIET;audioDone=QUIET;speakerPendingId=0;if(audioLock)xSemaphoreGive(audioLock);}
 void playPcm(const int16_t *samples,size_t count,uint32_t responseId=0){
   if(!audioOK||!samples||!count){notice="SPEAKER AUDIO IS NOT AVAILABLE.";screen=PROBLEM;if(responseId)Serial.printf("AUDIO_ERROR %u\n",responseId);return;}
@@ -108,11 +110,13 @@ void drawRadio(){
 }
 void draw(){
   rect(0,0,W,H,BG);text(12,14,"MEMORY",2,WHITE);text(97,14,"RADIO",2,CYAN);
-  text(12,40,online()?"GEMINI CONNECTED":"CONNECT USB + GEMINI",1,online()?GREEN:DIM);
+  text(12,40,wifiReady()?"WIFI ONLINE":online()?"USB CONNECTED":"SETUP WIFI",1,online()?GREEN:DIM);
+  if(screen!=RECORDING&&screen!=PROCESSING&&screen!=NETWORK_SETUP)text(175,40,"WIFI",1,CYAN);
   text(12,55,sdOK?(sdSaved?"SD: SAVED":"SD: READY"):"SD: NOT AVAILABLE",1,sdOK?GREEN:PINK);
   text(118,55,audioMode==PLAY?"SPEAKER PLAYING":audioOK?"SPEAKER READY":"NO AUDIO",1,audioMode==PLAY?PINK:DIM);
-  if(screen!=HOME&&screen!=RECORDING&&screen!=PROCESSING){text(211,40,"HOME",1,DIM);}
-  if(screen==HOME){
+  if(screen!=HOME&&screen!=RECORDING&&screen!=PROCESSING&&screen!=NETWORK_SETUP){text(211,40,"HOME",1,DIM);}
+  if(screen==NETWORK_SETUP){wifiDrawSetup();}
+  else if(screen==HOME){
     drawRadio();btn(12,190,216,audioMode==PLAY?"STOP SPEAKER":"TEST SPEAKER",PINK);
     btn(12,231,216,"RECORD A MEMORY",GREEN);btn(12,274,216,hasMemory?"EXPLORE YOUR MEMORY":"OPEN LATEST SAVED",CYAN);
   }else if(screen==RECORDING){
@@ -153,17 +157,19 @@ void draw(){
 }
 void problem(const String &message){waiting=false;uploadActive=false;receiveValid=false;notice=message;screen=PROBLEM;}
 void beginRecord(bool answer=false){
+  if(wifiBusy())return;
   if(!audioOK){problem("MICROPHONE IS NOT AVAILABLE.");return;}
   stopAudio();followup=answer;recordCount=0;recordLimit=(answer?30:60)*16000;
   if(answer)recordPrompt=memory.questions[questionIndex];screen=RECORDING;audioMode=RECORD;
 }
 void beginWait(const String &label,Screen back){stopAudio();waiting=true;requestId++;waitStart=millis();busyLabel=label;returnScreen=back;screen=PROCESSING;}
-bool needBackend(){if(online())return true;problem("OPEN CONNECT GEMINI ON YOUR COMPUTER. ENTER YOUR KEY THERE, THEN TRY AGAIN.");return false;}
+bool needBackend(){if(online())return true;problem("TAP WIFI AT THE TOP OF THE SCREEN TO CONNECT TO GEMINI. USB BRIDGE IS ALSO AVAILABLE.");return false;}
 void uploadAudio(bool answer){
   if(!needBackend())return;
   size_t samples=answer?recordCount.load():originalCount;
   if(samples<16000){problem("PLEASE RECORD AT LEAST ONE SECOND OF SPEECH.");return;}
   beginWait(answer?"GEMINI IS WEAVING YOUR NEW DETAIL INTO THE STORY...":"GEMINI IS LISTENING AND BUILDING YOUR MEMORY...",answer?QUESTION:REVIEW);
+  if(wifiReady()){if(!wifiStartJob(answer?"ANSWER":"STORY",questionIndex,0,answer?capture:original,samples))problem("NETWORK IS BUSY. PLEASE TRY AGAIN.");return;}
   const int16_t *buffer=answer?capture:original;size_t bytes=samples*2;
   String source=answer?"answer"+String(answerNumber):"story";
   uploadBuffer=(const uint8_t*)buffer;uploadLength=bytes;uploadOffset=0;uploadChunkSize=0;uploadAccepted=false;uploadRetries=0;uploadActive=true;
@@ -188,22 +194,27 @@ void finishRecord(){
   stopAudio();if(followup){answerNumber++;sdSaved=saveAudio(String("answer")+String(answerNumber),capture,recordCount.load());uploadAudio(true);}else{originalCount=recordCount.load();memcpy(original,capture,originalCount*2);hasMemory=false;memory=Memory();answerNumber=0;newFolder();sdSaved=saveAudio("story",original,originalCount);saveLatest();screen=REVIEW;}
 }
 void request(const char *kind,int a=0,int b=0){
+  if(wifiBusy())return;
   if(!needBackend())return;Screen previous=screen;
   beginWait(String(kind)=="LOAD"?"OPENING YOUR LAST SAVED MEMORY...":String(kind)=="EXCERPT"?"FINDING THAT MOMENT IN YOUR ORIGINAL VOICE...":"GEMINI IS PREPARING YOUR NARRATION...",previous);
-  requestKind=kind;Serial.printf("REQUEST %u %s %d %d %s\n",requestId,kind,a,b,memoryId.length()?memoryId.c_str():"LATEST");
+  requestKind=kind;if(wifiReady()&&String(kind)!="SPEAKER_CHECK"){if(!wifiStartJob(kind,a,b))problem("NETWORK IS BUSY. PLEASE TRY AGAIN.");return;}Serial.printf("REQUEST %u %s %d %d %s\n",requestId,kind,a,b,memoryId.length()?memoryId.c_str():"LATEST");
 }
 void playAiAudio(){
+  if(wifiBusy())return;
   if(audioMode==PLAY){stopAudio();return;}
   if(!audioOK){problem("THE SPEAKER AUDIO DRIVER IS NOT READY. TRY TEST SPEAKER ON THE HOME SCREEN.");return;}
   if(loadedAudioKind=="NARRATE"&&loadedAudioMemoryId==memoryId&&loadedAudioSamples){playPcm(reply,loadedAudioSamples);return;}
   stopAudio();size_t count=loadWav("recap",reply);
   if(count){loadedAudioKind="NARRATE";loadedAudioMemoryId=memoryId;loadedAudioSamples=count;playPcm(reply,count);return;}
   if(online()){request("NARRATE");return;}
-  problem("NO AI AUDIO SAVED YET. CONNECT GEMINI, OPEN YOUR SUMMARY, THEN TAP PLAY AI AUDIO.");
+  problem("NO AI AUDIO SAVED YET. CONNECT WIFI, OPEN YOUR SUMMARY, THEN TAP PLAY AI AUDIO.");
 }
-void cancelWait(){waiting=false;uploadActive=false;requestId++;receiveValid=false;screen=returnScreen;Serial.println("CANCEL");}
+void cancelWait(){wifiCancelJob();waiting=false;uploadActive=false;requestId++;receiveValid=false;screen=returnScreen;Serial.println("CANCEL");}
 void handleTouch(int x,int y){
   Serial.printf("TOUCH %d %d\n",x,y);
+  if(wifiBusy()&&screen!=PROCESSING)return;
+  if(screen==NETWORK_SETUP){if(y>=275){wifiCloseSetup();screen=HOME;}return;}
+  if(screen!=RECORDING&&screen!=PROCESSING&&y>=30&&y<53&&x>=167&&x<208){if(!wifiBusy()){wifiOpenSetup();screen=NETWORK_SETUP;}return;}
   if(screen!=RECORDING&&screen!=PROCESSING&&screen!=HOME&&y>=30&&y<55&&x>205){stopAudio();screen=HOME;return;}
   if(screen==HOME){if(y>=190&&y<222){if(audioMode==PLAY)stopAudio();else testSpeaker();}else if(y>=231&&y<263)beginRecord();else if(y>=274&&y<306){if(hasMemory){screen=SUMMARY;page=0;}else if(originalCount){screen=REVIEW;}else if(!loadSD())request("LOAD");}}
   else if(screen==RECORDING){if(y>=237&&y<269)finishRecord();else if(y>=278){stopAudio();screen=followup?QUESTION:HOME;}}
@@ -230,6 +241,9 @@ void serialCommand(String line){
   else if(sscanf(line.c_str(),"ACCEPT %u",&id)==1){if(uploadActive&&waiting&&id==requestId&&!uploadAccepted){uploadAccepted=true;uploadRetries=0;sendUploadChunk();}}
   else if(sscanf(line.c_str(),"ACK %u %d",&id,&a)==2){if(waiting&&id==requestId&&a>=0&&(size_t)a<=uploadLength){if(uploadActive){if((size_t)a==uploadOffset+uploadChunkSize){uploadOffset=a;uploadRetries=0;sendUploadChunk();}else if((size_t)a==uploadOffset){sendUploadChunk();}}else if(uploadAccepted&&(size_t)a==uploadLength)Serial.printf("UPLOAD_END2 %u %08X\n",requestId,uploadHash);}}
   else if(line=="STATUS")status();
+  else if(line=="WIFI_STATUS")wifiStatus();
+  else if(line=="WIFI_SETUP"&&!wifiBusy()){wifiOpenSetup();screen=NETWORK_SETUP;}
+  else if(line=="WIFI_TEST")Serial.printf("WIFI_TEST=%s\n",wifiSelfTest()?"PASS":"FAIL");
   else if(line=="PENDING")Serial.printf("PENDING title=%u summary=%u\n",pending.title.length(),pending.summary.length());
   else if(line=="FRAME"){Serial.printf("FRAME %d\n",W*H*2);Serial.write((uint8_t*)fb,W*H*2);Serial.println("\nFRAME_END");}
   else if(line=="RECORD")beginRecord();
@@ -295,11 +309,13 @@ void setup(){
   SD_MMC.setPins(38,40,39);sdOK=SD_MMC.begin("/sdcard",true,false,20000);
   if(sdOK){sdOK=SD_MMC.cardType()!=CARD_NONE&&SD_MMC.mkdir("/memory-radio");if(sdOK){loadSD();screen=HOME;}}
   Serial.println("MEMORY RADIO READY");status();
+  wifiInit();
 }
 void loop(){
-  if(!fb){delay(1000);return;}serialPoll();touchPoll();uploadPoll();int done=audioDone.exchange(QUIET);if(done==RECORD&&screen==RECORDING)finishRecord();
+  if(!fb){delay(1000);return;}serialPoll();touchPoll();wifiPoll();uploadPoll();int done=audioDone.exchange(QUIET);if(done==RECORD&&screen==RECORDING)finishRecord();
   uint32_t playingId=speakerStartedId.exchange(0);if(playingId)Serial.printf("AUDIO_PLAYING %u %u\n",playingId,speakerAckBytes.load());
   if(speakerFault.exchange(false)){uint32_t failed=speakerFailedId.exchange(0);if(failed)Serial.printf("AUDIO_ERROR %u\n",failed);problem("SPEAKER OUTPUT FAILED. PLEASE RESTART THE DEVICE AND TRY TEST SPEAKER.");}
-  if(waiting&&millis()-waitStart>150000){waiting=false;requestId++;problem("GEMINI TOOK TOO LONG. YOUR RECORDING IS AVAILABLE TO RETRY.");}
+  if(waiting&&millis()-waitStart>(wifiBusy()?240000u:150000u)){wifiCancelJob();waiting=false;requestId++;problem("GEMINI TOOK TOO LONG. YOUR RECORDING IS AVAILABLE TO RETRY.");}
   static uint32_t lastFrame=0;if(millis()-lastFrame>=100){lastFrame=millis();draw();}delay(3);
 }
+#include "wifi_radio.h"
