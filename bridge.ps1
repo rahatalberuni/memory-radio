@@ -1,6 +1,7 @@
 param([string]$Port='COM3',[string]$Model='auto',[string]$VoiceModel='auto',[switch]$SelfTest,[switch]$Library,[switch]$AnalyzeSaved,[switch]$CheckApi)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'gemini-errors.ps1')
+. (Join-Path $PSScriptRoot 'gemini-client.ps1')
 $memoryRoot=Join-Path $PSScriptRoot 'memories'
 function To-Display([string]$Value){
   $normal=$Value.Normalize([Text.NormalizationForm]::FormD);$result=New-Object Text.StringBuilder
@@ -148,13 +149,9 @@ if($VoiceModel -eq 'auto'){$VoiceModel=@('gemini-3.1-flash-tts-preview','gemini-
 New-Item -ItemType Directory -Path $memoryRoot -Force|Out-Null
 
 function Generate($Body,[string]$WhichModel){
-  $uri=$base+'/models/'+[Uri]::EscapeDataString($WhichModel)+':generateContent'
-  $json=$Body|ConvertTo-Json -Depth 25 -Compress
-  try{return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 85}catch{
-    $failure=Get-GeminiFailure $_ $apiKey
-    Save-GeminiStatus (Join-Path $PSScriptRoot 'gemini-status.json') $WhichModel 'generate_content' $failure
-    throw (Format-GeminiFailure $failure)
-  }
+  $result=Invoke-MemoryRadioGemini $Body $WhichModel $available $base $headers $apiKey (Join-Path $PSScriptRoot 'gemini-status.json')
+  if($result.Model -ne $WhichModel){if($WhichModel -match 'tts'){$script:VoiceModel=$result.Model}else{$script:Model=$result.Model};Write-Host "Using working Gemini model: $($result.Model)"}
+  return $result.Response
 }
 function Send-Memory([string]$Id,$Memory){
   $serial.WriteLine("BEGIN $Id")
