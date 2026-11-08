@@ -3,3 +3,4 @@ memories/
 .gemini-key.xml
 bridge-output.log
 bridge-error.log
+gemini-status.json
