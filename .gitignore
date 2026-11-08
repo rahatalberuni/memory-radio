@@ -1,0 +1,5 @@
+build/
+memories/
+.gemini-key.xml
+bridge-output.log
+bridge-error.log
