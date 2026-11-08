@@ -141,7 +141,7 @@ try{$catalog=Invoke-RestMethod -Method Get -Uri ($base+'/models?pageSize=1000') 
 }
 $available=@($catalog.models|Where-Object {$_.supportedGenerationMethods -contains 'generateContent'}|ForEach-Object {$_.name -replace '^models/',''})
 if($Model -eq 'auto'){
-  $Model=@('gemini-3.8-flash','gemini-3.5-flash','gemini-3-flash-preview','gemini-2.5-flash')|Where-Object {$available -contains $_}|Select-Object -First 1
+  $Model=@('gemini-3.5-flash-lite','gemini-2.5-flash-lite','gemini-2.5-flash','gemini-3-flash-preview','gemini-3.5-flash','gemini-3.8-flash')|Where-Object {$available -contains $_}|Select-Object -First 1
   if(!$Model){$Model=$available|Where-Object {$_ -match '^gemini-.*flash' -and $_ -notmatch 'tts|image|live|audio|lite'}|Sort-Object -Descending|Select-Object -First 1}
   if(!$Model){throw 'No compatible Gemini audio understanding model is available to this API key.'}
 }
@@ -199,6 +199,10 @@ if($CheckApi){
   }catch{Write-Output $_.Exception.Message;exit 1}
   exit
 }
+Write-Output "Checking Gemini generation before opening USB (model: $Model)..."
+$connectionProbe=Generate @{contents=@(@{parts=@(@{text='Reply with the single word OK.'})});generationConfig=@{maxOutputTokens=512}} $Model
+if(!$connectionProbe.candidates){throw 'Gemini generation check returned no result. Run Diagnose Gemini before recording.'}
+Write-Output "Gemini generation check passed with $Model."
 $serial=New-Object IO.Ports.SerialPort $Port,115200,'None',8,'One'
 $serial.ReadTimeout=1000;$serial.WriteTimeout=15000;$serial.ReadBufferSize=262144;$serial.NewLine="`n"
 try{
