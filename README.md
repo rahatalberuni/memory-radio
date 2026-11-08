@@ -46,6 +46,8 @@ To replace the key, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -STA 
 
 Bridge output is in `bridge-output.log` and `bridge-error.log`. Keys and raw audio are not logged. If organization fails, your original WAV remains on the card. Open your recording and retry. If voice generation is unavailable, the text summary and original voice still work. After unplugging the board, restart the bridge. Canceling a request on the device ignores late results; a cloud request already in flight may still finish and be billed.
 
+If a Gemini request fails, double-click **Diagnose Gemini.cmd**. It checks generation access using the saved key in your Windows session, without opening the USB port or uploading a personal recording. The result is saved in `gemini-status.json` (excluded from Git). The updated bridge also records the HTTP code, provider status, model, and sanitized error message for failed API calls. Keys are redacted. A successful model-list request alone does not prove that generation quota or permissions are available. Restart Connect Gemini after updating the bridge so the running process uses the latest code.
+
 SD status appears on every screen. **SD: Saved** indicates the last save completed. **SD: Not available** indicates mounting failed; the card is never formatted automatically. A mounted card with a write failure will remain **SD: Ready** rather than claim the recording was saved. Keep power connected until the recording screen closes and the save completes.
 
 ## Development
@@ -59,6 +61,8 @@ SD status appears on every screen. **SD: Saved** indicates the last save complet
 - inspect.ps1: captures the real framebuffer to build/.
 - verify.ps1: hardware integration test with an explicitly labeled test fixture; it creates a short test recording and files under a new /memory-radio folder. It does not call Gemini or claim that fixture is AI output.
 - test-transfer.ps1: exercises the numbered USB transfer with a full 60-second payload, lost and duplicate packets, and checksum corruption. It does not modify recordings or call Gemini.
+- gemini-errors.ps1 / test-gemini-errors.ps1: provider-error parsing, credential redaction, and diagnostic checks.
+- Diagnose Gemini.cmd: local API generation check; no personal recording is submitted.
 
 Recordings use an acknowledged, numbered-chunk upload protocol. The computer verifies the entire recording's checksum before calling Gemini. Missing chunks are retried and duplicate chunks are ignored. The device remains responsive during upload; existing saved recordings can be retried without recording again.
 
