@@ -1,5 +1,6 @@
-param([string]$Port='COM3',[string]$Model='auto',[string]$VoiceModel='auto',[switch]$SelfTest,[switch]$Library,[switch]$AnalyzeSaved)
+param([string]$Port='COM3',[string]$Model='auto',[string]$VoiceModel='auto',[switch]$SelfTest,[switch]$Library,[switch]$AnalyzeSaved,[switch]$CheckApi)
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'gemini-errors.ps1')
 $memoryRoot=Join-Path $PSScriptRoot 'memories'
 function To-Display([string]$Value){
   $normal=$Value.Normalize([Text.NormalizationForm]::FormD);$result=New-Object Text.StringBuilder
@@ -134,7 +135,9 @@ if(!$apiKey){throw 'No key configured. Open Connect Gemini.cmd and enter your AP
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 $headers=@{'x-goog-api-key'=$apiKey}
 $base='https://generativelanguage.googleapis.com/v1beta'
-$catalog=Invoke-RestMethod -Method Get -Uri ($base+'/models?pageSize=1000') -Headers $headers -TimeoutSec 20
+try{$catalog=Invoke-RestMethod -Method Get -Uri ($base+'/models?pageSize=1000') -Headers $headers -TimeoutSec 20}catch{
+  $failure=Get-GeminiFailure $_ $apiKey;Save-GeminiStatus (Join-Path $PSScriptRoot 'gemini-status.json') $Model 'list_models' $failure;throw (Format-GeminiFailure $failure)
+}
 $available=@($catalog.models|Where-Object {$_.supportedGenerationMethods -contains 'generateContent'}|ForEach-Object {$_.name -replace '^models/',''})
 if($Model -eq 'auto'){
   $Model=@('gemini-3.8-flash','gemini-3.5-flash','gemini-3-flash-preview','gemini-2.5-flash')|Where-Object {$available -contains $_}|Select-Object -First 1
@@ -147,7 +150,11 @@ New-Item -ItemType Directory -Path $memoryRoot -Force|Out-Null
 function Generate($Body,[string]$WhichModel){
   $uri=$base+'/models/'+[Uri]::EscapeDataString($WhichModel)+':generateContent'
   $json=$Body|ConvertTo-Json -Depth 25 -Compress
-  return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 85
+  try{return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 85}catch{
+    $failure=Get-GeminiFailure $_ $apiKey
+    Save-GeminiStatus (Join-Path $PSScriptRoot 'gemini-status.json') $WhichModel 'generate_content' $failure
+    throw (Format-GeminiFailure $failure)
+  }
 }
 function Send-Memory([string]$Id,$Memory){
   $serial.WriteLine("BEGIN $Id")
@@ -184,6 +191,17 @@ function Get-Folder([string]$MemoryId){
   return Join-Path $memoryRoot $MemoryId
 }
 
+if($CheckApi){
+  Write-Output "Testing Gemini generation with model: $Model"
+  try{
+    $probe=Generate @{contents=@(@{parts=@(@{text='Reply with the single word OK.'})});generationConfig=@{maxOutputTokens=512}} $Model
+    if(!$probe.candidates){throw 'Gemini returned no candidate for the connection check'}
+    $success=[pscustomobject]@{http_code=200;status='OK';message='Gemini generation succeeded. API key and model access work.';retry_delay=''}
+    Save-GeminiStatus (Join-Path $PSScriptRoot 'gemini-status.json') $Model 'generation_check' $success
+    Write-Output $success.message
+  }catch{Write-Output $_.Exception.Message;exit 1}
+  exit
+}
 $serial=New-Object IO.Ports.SerialPort $Port,115200,'None',8,'One'
 $serial.ReadTimeout=1000;$serial.WriteTimeout=15000;$serial.ReadBufferSize=262144;$serial.NewLine="`n"
 try{
@@ -250,10 +268,10 @@ For a follow-up: update the existing memory with newly stated details, preserve 
     }catch{
       $serial.ReadTimeout=1000
       if($id){
-        $message='Gemini could not finish. Check your internet connection, API key, model access, or quota, then retry.'
-        if($_.Exception.Message -notmatch 'remote server|Invoke-RestMethod|WebException|SSL|connection was closed'){$message=$_.Exception.Message}
-        if($message.Length -gt 260){$message=$message.Substring(0,260)}
-        $serial.WriteLine("ERROR $id "+(Encode $message));Write-Warning "Request $id failed. $message"
+        $message=Format-GeminiFailure (Get-GeminiFailure $_ $apiKey)
+        Write-Warning "Request $id failed. $message"
+        $screenMessage=$message;if($screenMessage.Length -gt 260){$screenMessage=$screenMessage.Substring(0,260)}
+        $serial.WriteLine("ERROR $id "+(Encode $screenMessage))
       }
     }
   }
