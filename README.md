@@ -9,9 +9,13 @@ A touchscreen oral-history recorder for the LCDWIKI ES3C28P ESP32-S3 N16R8. Gemi
 3. Tap **Organize with Gemini**. This sends that recording through the computer to Google's Gemini API. The device then shows the generated summary. Tap the page controls to read more.
 4. Tap **People**, **Places**, or **Events**. Tap an entry to read its description and supporting quote; **Hear original moment** plays the corresponding recording excerpt. Timestamps are AI estimates and may need human review.
 5. Tap **Questions**, select a Gemini-generated follow-up, and tap **Record my answer**. Record up to 30 seconds. The answer is saved on the card and sent to Gemini to update the existing memory. Questions can also be read aloud.
-6. Tap **Narrate** to generate and play a spoken recap. Speech generation uses a separate compatible Gemini TTS model and depends on your account's model access and quota.
+6. Tap **Play AI audio** to hear the generated recap through the ESP32 speaker. A saved recap plays immediately; if no recap exists, the bridge requests Gemini speech generation, saves the returned WAV, and starts speaker playback. The button changes to **Stop audio** while playing. Speech generation uses a separate compatible Gemini TTS model and depends on your account's model access and quota.
 
-Recording and saved playback work without internet. New AI organization, follow-ups, and narration need the computer bridge and internet. When disconnected, the summary's **Play audio** plays a previously saved recap, or the original story if no recap exists. Saved quotes can replay local audio excerpts without the computer. After a restart, the latest recorded memory and any saved summary are restored from the card.
+Recording and saved playback work without internet. New AI organization, follow-ups, and narration need the computer bridge and internet. When disconnected, **Play AI audio** can replay a saved AI recap. If no AI recap is saved, it asks you to connect Gemini. Original recordings have their separate **Play my recording** button. Saved quotes can replay local audio excerpts without the computer. After a restart, the latest recorded memory and any saved summary are restored from the card.
+
+The home screen has a **Test speaker** button that plays three short tones without Gemini or internet. The header displays **Speaker playing** while audio is active. All PCM playback goes through the onboard ES8311 codec and the speaker amplifier (GPIO1, active low). The bridge waits for an **AUDIO_PLAYING** acknowledgement after the ESP32 successfully writes a playback frame to I2S. This verifies the software output path; audible quality and the physical speaker connection still need a listening check. USB or audio-driver errors are shown explicitly rather than reported as successful playback.
+
+The computer bridge also reuses an existing generated recap when it is newer than the current memory JSON, so replay does not require another speech-generation request. `replay-cached-recap.ps1` can transfer that cached recap to the connected device without reading the API key; it saves recap.wav and verifies the I2S playback acknowledgement.
 
 The first version opens the latest memory on the device. Earlier memories stay in their separate folders on the card and computer. The interface uses an ASCII font; original Unicode output and the full transcript are preserved in the computer's JSON archive. Each recording is limited to 60 seconds (30 seconds for a follow-up).
 
@@ -65,6 +69,8 @@ SD status appears on every screen. **SD: Saved** indicates the last save complet
 - inspect.ps1: captures the real framebuffer to build/.
 - verify.ps1: hardware integration test with an explicitly labeled test fixture; it creates a short test recording and files under a new /memory-radio folder. It does not call Gemini or claim that fixture is AI output.
 - test-transfer.ps1: exercises the numbered USB transfer with a full 60-second payload, lost and duplicate packets, and checksum corruption. It does not modify recordings or call Gemini.
+- test-speaker.ps1: checks the home speaker button, amplifier enable, nonzero I2S writes, and incoming response playback acknowledgement. It retains the original recording and saves its test tone separately as speaker-test.wav.
+- replay-cached-recap.ps1: sends the current memory's cached narration to the device, saves it on the card, and starts speaker playback.
 - gemini-errors.ps1 / test-gemini-errors.ps1: provider-error parsing, credential redaction, and diagnostic checks.
 - gemini-client.ps1 / test-gemini-client.ps1: bounded retries and compatible fallback for temporary server errors.
 - Diagnose Gemini.cmd: local API generation check; no personal recording is submitted.
